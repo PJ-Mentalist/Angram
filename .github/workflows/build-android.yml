@@ -1,0 +1,110 @@
+name: Build Angram
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android tools
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+
+      - name: Configure Angram
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        shell: python
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          app_id = os.environ["TELEGRAM_API_ID"].strip()
+          app_hash = os.environ["TELEGRAM_API_HASH"].strip()
+
+          if not re.fullmatch(r"[1-9][0-9]*", app_id):
+              raise SystemExit("Check TELEGRAM_API_ID secret")
+          if not re.fullmatch(r"[a-fA-F0-9]{32}", app_hash):
+              raise SystemExit("Check TELEGRAM_API_HASH secret")
+
+          p = Path("TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java")
+          text = p.read_text()
+          replacements = {
+              r"public static int APP_ID = .*?;":
+                  "public static int APP_ID = " + app_id + ";",
+              r"public static String APP_HASH = .*?;":
+                  'public static String APP_HASH = "' + app_hash + '";',
+              r"public static boolean SUPPORTS_PASSKEYS = .*?;":
+                  "public static boolean SUPPORTS_PASSKEYS = false;",
+              r"public static boolean CHECK_UPDATES = .*?;":
+                  "public static boolean CHECK_UPDATES = false;",
+          }
+          for pattern, value in replacements.items():
+              text, count = re.subn(pattern, lambda m: value, text)
+              if count != 1:
+                  raise SystemExit("BuildVars changed: update workflow")
+          p.write_text(text)
+
+          p = Path("gradle.properties")
+          text = p.read_text()
+          text = re.sub(r"(?m)^APP_PACKAGE=.*$", "APP_PACKAGE=dev.pjmentalist.angram", text)
+          text = re.sub(r"(?m)^org.gradle.jvmargs=.*$", "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g", text)
+          text = re.sub(r"(?m)^org.gradle.parallel=.*$", "org.gradle.parallel=false", text)
+          p.write_text(text)
+
+          p = Path("TMessagesProj_AppStandalone/build.gradle")
+          text = p.read_text()
+          text = text.replace(
+              'storeFile file("../TMessagesProj/config/release.keystore")',
+              'storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")'
+          )
+          text = text.replace("keyAlias RELEASE_KEY_ALIAS", 'keyAlias "androiddebugkey"')
+          p.write_text(text)
+
+          # Firebase push will be configured separately.
+          for name in ["TMessagesProj", "TMessagesProj_AppStandalone"]:
+              p = Path(name) / "build.gradle"
+              p.write_text(p.read_text() + '\ntasks.configureEach { if (name.endsWith("GoogleServices")) { enabled = false } }\n')
+
+      - name: Create test signing key
+        run: |
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -dname "CN=Angram Debug" \
+            -keyalg RSA -keysize 2048 -validity 3650
+
+      - name: Build APK
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+        run: |
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_AppStandalone:assembleAfatDebug --no-daemon --max-workers=2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Angram-test-APK
+          path: TMessagesProj_AppStandalone/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 7
